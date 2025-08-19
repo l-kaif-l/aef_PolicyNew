@@ -213,6 +213,7 @@
 #     st.warning("Please upload at least one file.")
 
 # app.py
+# app.py
 import os, io, re, time, string
 from typing import List, Dict
 import streamlit as st
@@ -220,12 +221,16 @@ from docx import Document
 from openai import AzureOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# ================== PAGE ==================
+# =========================
+# Page & Intro
+# =========================
 st.set_page_config(page_title="NF Transcript Toolkit", layout="wide")
 st.title("🌾 NF Transcript Toolkit")
-st.caption("Switch between **Insights Extraction** and **Codebook Coding (KII)** in one app. Keys are read from Streamlit Secrets.")
+st.caption("Switch between **Insights Extraction** and **Codebook Coding (KII)**. Azure keys are read from Streamlit Secrets.")
 
-# ================== AZURE CLIENT ==================
+# =========================
+# Azure client (from Secrets)
+# =========================
 def init_client():
     try:
         client = AzureOpenAI(
@@ -235,13 +240,26 @@ def init_client():
         )
         deployment = st.secrets.get("DEPLOYMENT", "gpt-4o")
         return client, deployment
-    except Exception as e:
+    except Exception:
         st.error("Azure OpenAI secrets missing/invalid. Set them in App → Settings → Secrets.")
         st.stop()
 
 client, DEPLOYMENT = init_client()
 
-# ================== HELPERS (shared) ==================
+@retry(wait=wait_exponential(multiplier=1, min=1, max=20),
+       stop=stop_after_attempt(6),
+       retry=retry_if_exception_type(Exception))
+def call_azure(prompt: str) -> str:
+    res = client.chat.completions.create(
+        model=DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    return res.choices[0].message.content.strip()
+
+# =========================
+# Shared helpers
+# =========================
 def read_docx_bytes(b: bytes) -> str:
     doc = Document(io.BytesIO(b))
     return "\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
@@ -267,7 +285,8 @@ def chunk_text(text: str, max_chars: int = 6000, overlap: int = 400) -> List[str
             i += max_chars
         chunks.append(chunk.strip())
         i -= overlap
-        if i < 0: i = 0
+        if i < 0:
+            i = 0
     # de-dup by first 200 chars
     seen, dedup = set(), []
     for c in chunks:
@@ -281,25 +300,17 @@ def normalize_bullets(lines: List[str]) -> List[str]:
     out, seen = [], set()
     for ln in lines:
         s = re.sub(r'\s+', ' ', ln.strip().rstrip('.'))
-        if not s: continue
+        if not s:
+            continue
         key = s.lower()
         if key not in seen:
             seen.add(key)
             out.append(s if s.endswith('.') else s + '.')
     return out
 
-@retry(wait=wait_exponential(multiplier=1, min=1, max=20),
-       stop=stop_after_attempt(6),
-       retry=retry_if_exception_type(Exception))
-def call_azure(prompt: str) -> str:
-    res = client.chat.completions.create(
-        model=DEPLOYMENT,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    return res.choices[0].message.content.strip()
-
-# ================== MODE 1: Insights Extraction ==================
+# =========================
+# Mode 1 — Insights Extraction
+# =========================
 def chunk_prompt(chunk: str) -> str:
     return f"""
 You are a senior qualitative researcher. Read the TEXT and extract clear, non-generic insights.
@@ -346,6 +357,7 @@ def run_insights(file_name: str, content: bytes) -> str:
     text = clean_text(text)
     chunks = chunk_text(text, max_chars=6000, overlap=400)
     pooled_insights, pooled_quotes = [], []
+
     for i, ch in enumerate(chunks, start=1):
         resp = call_azure(chunk_prompt(ch))
         parts = re.split(r'\bQUOTES:\s*', resp, flags=re.I)
@@ -356,12 +368,15 @@ def run_insights(file_name: str, content: bytes) -> str:
         pooled_insights.extend(ins)
         pooled_quotes.extend(qts)
         st.progress(i/len(chunks), text=f"Extracting {i}/{len(chunks)}")
+
     pooled_insights = normalize_bullets(pooled_insights)
     pooled_quotes = normalize_bullets(pooled_quotes)
     final_text = call_azure(synthesis_prompt(pooled_insights, pooled_quotes, file_name)).strip()
     return f"INSIGHTS REPORT — {file_name}\n\n{final_text}"
 
-# ================== MODE 2: Codebook Coding (KII) ==================
+# =========================
+# Mode 2 — Codebook Coding (KII)
+# =========================
 KII_TAXONOMY: Dict[str, Dict[str, str]] = {
     "Respondent Background (BCK)": {
         "BCK_Role": "Role of respondent (farmer/CRP/leader).",
@@ -471,16 +486,24 @@ def run_coding(file_name: str, content: bytes, max_chars: int) -> str:
         time.sleep(0.05)
     return "\n".join(lines)
 
-# ================== SIDEBAR (mode + upload) ==================
-mode = st.sidebar.radio("Mode", ["Insights Extraction", "Codebook Coding (KII)"])
+# =========================
+# Sidebar (Mode + Upload)
+# =========================
+st.sidebar.title("Mode")
+mode = st.sidebar.radio("Choose task:", ["Insights Extraction", "Codebook Coding (KII)"])
 uploaded_files = st.sidebar.file_uploader("Upload transcripts (.docx / .txt)", type=["docx","txt"], accept_multiple_files=True)
 
+# =========================
+# Main — Mode routing
+# =========================
 if mode == "Insights Extraction":
-    st.sidebar.caption("Generates a single insights report per file (bullets + short quotes).")
-    if uploaded_files and st.sidebar.button("🚀 Generate Insights"):
+    st.header("Transcript → Insights Extraction")
+    st.markdown("Generates one insights report per file (bullets + short quotes).")
+    if uploaded_files and st.button("🚀 Generate Insights"):
         for up in uploaded_files:
             st.write(f"**Processing:** `{up.name}`")
-            report = run_insights(up.name, up.read())
+            content = up.read()
+            report = run_insights(up.name, content)
             with st.expander(f"📄 Insights: {up.name}", expanded=True):
                 st.text(report)
             st.download_button(
@@ -489,16 +512,18 @@ if mode == "Insights Extraction":
                 file_name=f"{os.path.splitext(up.name)[0]}_INSIGHTS.txt",
                 mime="text/plain"
             )
-    elif st.sidebar.button("🚀 Generate Insights") and not uploaded_files:
+    elif st.button("🚀 Generate Insights") and not uploaded_files:
         st.warning("Please upload at least one file.")
 
 else:
-    seg_size = st.sidebar.slider("Max segment size (chars)", 800, 3000, 1800, 100)
-    st.sidebar.caption("Returns Theme/Subcodes/Insight/Quote per segment.")
-    if uploaded_files and st.sidebar.button("🚀 Run Coding"):
+    st.header("KII Transcript → Thematic Coding (Plain Text)")
+    st.markdown("Returns Theme/Subcodes/Insight/Quote per segment.")
+    seg_size = st.slider("Max segment size (chars)", 800, 3000, 1800, 100)
+    if uploaded_files and st.button("🚀 Run Coding"):
         for up in uploaded_files:
             st.write(f"**Processing:** `{up.name}`")
-            report = run_coding(up.name, up.read(), max_chars=seg_size)
+            content = up.read()
+            report = run_coding(up.name, content, max_chars=seg_size)
             with st.expander(f"📄 Coded Report: {up.name}", expanded=True):
                 st.text(report)
             st.download_button(
@@ -507,5 +532,6 @@ else:
                 file_name=f"{os.path.splitext(up.name)[0]}_KII_CODED.txt",
                 mime="text/plain"
             )
-    elif st.sidebar.button("🚀 Run Coding") and not uploaded_files:
+    elif st.button("🚀 Run Coding") and not uploaded_files:
         st.warning("Please upload at least one file.")
+
